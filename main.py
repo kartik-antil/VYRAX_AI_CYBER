@@ -1,5 +1,8 @@
-
+import io
 from pathlib import Path
+
+import librosa
+from transformers import pipeline
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse
@@ -7,11 +10,27 @@ from fastapi.responses import HTMLResponse
 app = FastAPI(
     title="Vyrax AI Cyber",
     description="Real-Time Speech Emotion Analysis",
-    version="0.2.0"
+    version="0.2.0",
 )
 
 ALLOWED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg"}
 MAX_SIZE = 25 * 1024 * 1024
+
+EMOTION_MODEL = "Dpngtm/wav2vec2-emotion-recognition"
+
+emotion_classifier = None
+
+
+def get_emotion_classifier():
+    global emotion_classifier
+
+    if emotion_classifier is None:
+        emotion_classifier = pipeline(
+            "audio-classification", model=EMOTION_MODEL, device=-1
+        )
+
+    return emotion_classifier
+
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -133,7 +152,7 @@ button:disabled { opacity: .55; cursor: wait; }
             </div>
             <div class="card">
                 <small>MAX FILE SIZE</small>
-                <h2>15 MB</h2>
+                <h2>25 MB</h2>
                 <p>Per audio upload</p>
             </div>
         </section>
@@ -145,11 +164,12 @@ button:disabled { opacity: .55; cursor: wait; }
                 Use only recordings you are authorized to process.
             </div>
 
+            
             <form id="uploadForm">
                 <div class="drop">
                     <div class="upload-icon">🎙️</div>
                     <strong>Select an audio recording</strong>
-                    <div class="desc">WAV, MP3, M4A or OGG · Maximum 15 MB</div>
+                    <div class="desc">WAV, MP3, M4A or OGG · Maximum 25 MB</div>
                     <input
                         type="file" id="audio"
                         accept=".wav,.mp3,.m4a,.ogg,audio/*" required>
@@ -161,13 +181,14 @@ button:disabled { opacity: .55; cursor: wait; }
             </div>
         </section>
 
-        <section class="panel">
-            <h3>Analysis Results</h3>
-            <div class="desc" id="results">
-                No analysis available yet. Emotion detection will appear here
-                after an AI model is integrated.
-            </div>
-        </section>
+        
+    <section class="panel">
+    <h3>AI Analysis Results</h3>
+    <div class="desc" id="results" style="white-space: pre-line;">
+        No analysis available yet. Upload an audio file to begin.
+    </div>
+</section>
+
 
         <div class="footer">
             Vyrax AI Cyber · Prototype v0.2 · AI signals are not proof of guilt.
@@ -184,6 +205,7 @@ const button = document.getElementById("analyzeBtn");
 
 form.addEventListener("submit", async (event) => {
     event.preventDefault();
+    
 
     const file = audioInput.files[0];
 
@@ -194,8 +216,9 @@ form.addEventListener("submit", async (event) => {
 
     button.disabled = true;
     message.textContent = "Uploading audio...";
+    
     results.textContent = "Waiting for the upload response.";
-
+    
     const data = new FormData();
     data.append("audio", file);
 
@@ -214,8 +237,43 @@ form.addEventListener("submit", async (event) => {
         message.textContent =
             "Upload successful: " + result.filename;
 
-        results.textContent =
-            result.message + " Actual emotion detection is not enabled yet.";
+        
+if (result.analysis) {
+    const predictions = result.analysis.all_predictions;
+    const topEmotion = result.analysis.emotion;
+    const confidence = result.analysis.confidence;
+
+    results.style.whiteSpace = "normal";
+
+    results.innerHTML = `
+        <div style="padding:16px; background:#18213a; border-radius:12px; margin-top:12px;">
+            <div style="color:#8c98b5; font-size:12px;">DETECTED EMOTION</div>
+            <h2 style="color:#72dcff; margin:8px 0;">${topEmotion.toUpperCase()}</h2>
+            <div style="font-size:14px;">Confidence: ${confidence}%</div>
+        </div>
+
+        <h4 style="margin:22px 0 14px;">All Emotion Predictions</h4>
+
+        ${predictions.map(item => `
+            <div style="margin:14px 0;">
+                <div style="display:flex; justify-content:space-between; gap:12px; margin-bottom:6px;">
+                    <span>${item.emotion}</span>
+                    <strong>${item.confidence}%</strong>
+                </div>
+                <div style="height:8px; background:#252e49; border-radius:8px; overflow:hidden;">
+                    <div style="height:100%; width:${Math.max(0, Math.min(100, Number(item.confidence)))}%; background:linear-gradient(90deg,#4b8dff,#9874ff); border-radius:8px;"></div>
+                </div>
+            </div>
+        `).join("")}
+    `;
+} else {
+    results.textContent =
+        result.message || "No analysis result received.";
+}
+
+
+ 
+
     } catch (error) {
         message.textContent = "Error: " + error.message;
     } finally {
@@ -244,27 +302,51 @@ async def analyze_audio(audio: UploadFile = File(...)):
 
     if extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(
-            status_code=400,
-            detail="Upload a WAV, MP3, M4A or OGG audio file."
+            status_code=400, detail="Upload a WAV, MP3, M4A or OGG audio file."
         )
 
     content = await audio.read()
 
     if not content:
-        raise HTTPException(
-            status_code=400,
-            detail="Audio file is empty."
-        )
+        raise HTTPException(status_code=400, detail="Audio file is empty.")
 
     if len(content) > MAX_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail="Maximum file size is 15 MB."
-        )
+        raise HTTPException(status_code=413, detail="Maximum file size is 25 MB.")
 
-    return {
-        "filename": Path(audio.filename).name,
-        "status": "uploaded",
-        "message": "Audio received successfully.",
-        "analysis": None
-    }
+    try:
+        audio_buffer = io.BytesIO(content)
+
+        waveform, sample_rate = librosa.load(audio_buffer, sr=16000, mono=True)
+
+        if len(waveform) == 0:
+            raise ValueError("No audio samples found.")
+
+        classifier = get_emotion_classifier()
+
+        predictions = classifier({"raw": waveform, "sampling_rate": sample_rate})
+
+        best_prediction = max(predictions, key=lambda item: item["score"])
+
+        return {
+            "filename": Path(audio.filename or "audio").name,
+            "status": "analyzed",
+            "message": "AI emotion analysis completed.",
+            "analysis": {
+                "emotion": best_prediction["label"],
+                "confidence": round(best_prediction["score"] * 100, 2),
+                "all_predictions": [
+                    {
+                        "emotion": item["label"],
+                        "confidence": round(item["score"] * 100, 2),
+                    }
+                    for item in predictions
+                ],
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Audio analysis failed: {str(exc)}"
+        )
